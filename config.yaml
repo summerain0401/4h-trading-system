@@ -1,0 +1,66 @@
+# ============================================================
+# 4H 波段半自动交易系统 — 配置文件
+# ============================================================
+
+# 交易标的
+symbol: "BTC"
+network: "mainnet"  # mainnet / testnet
+
+# 杠杆（BTC: 3-5x）
+leverage: 5
+
+# 风险管理
+risk:
+  max_risk_per_trade: 0.015      # 单笔最大亏损占比（总资金的 1.5%）
+  max_total_position_pct: 1.0    # 最大总仓位占比（100%）
+
+# 各阶段止损 ATR 倍数
+stop_loss:
+  phase_two_atr_mult: 2.0        # 阶段二：20VWMA 反侧 + 2.0 ATR
+  phase_three_atr_mult: 0.0      # 阶段三：入场 K 线高/低点（不使用 ATR）
+  phase_four_atr_mult: 0.5       # 阶段四：20VWMA 反侧 + 0.5 ATR
+
+# 止盈参数
+take_profit:
+  phase_two_track: "20VWMA"      # 底仓跟踪均线
+  phase_three_track: "9EMA"      # 追仓跟踪均线
+  phase_four_track: "20VWMA"     # 主仓跟踪均线
+  atr_buffer: 0.8                # 跟踪止盈 ATR 缓冲（0.8 ATR 才算真正突破，减少假突破扫出）
+
+# ADX 阈值
+adx:
+  ranging_threshold: 20          # ADX < 20 → 震荡市，不做
+  weak_trend_threshold: 25       # ADX 20-25 → 弱趋势，禁用阶段三
+
+# 多空不对称参数（V9：上涨贪婪驱动 vs 下跌恐惧驱动）
+direction:
+  long:
+    adx_entry: 25                # 做多入场 ADX 门槛（上涨趋势确认相对容易）
+    stop_loss_atr: 2.0           # 阶段二止损 ATR 倍数（回调温和）
+    approaching_atr: 0.8         # 抢跑入场 ATR 阈值（慢涨给时间）
+    trailing_atr: 0.8            # 跟踪止盈 ATR 缓冲
+    timeout_bars: 12             # 持仓超时 K 线数（上涨慢，给更多时间）
+  short:
+    adx_entry: 25                # 做空入场 ADX 门槛（与 LONG 相同，好趋势早期 ADX 不高）
+    stop_loss_atr: 2.5           # 阶段二止损 ATR 倍数（反弹暴烈，需要更宽）
+    approaching_atr: 0.8         # 抢跑入场 ATR 阈值（与 LONG 相同，暴跌期 gap 扩大需要更宽）
+    trailing_atr: 1.0            # 跟踪止盈 ATR 缓冲（反弹常刺穿 VWMA 再回落）
+    timeout_bars: 8              # 持仓超时 K 线数（下跌不磨蹭，更快判断）
+
+# 数据
+data:
+  historical_days: 60            # 启动时拉取历史数据天数
+  kline_interval: "4h"           # 主交易周期
+  daily_interval: "1d"           # 大周期
+
+# 通知
+notifications:
+  terminal: true                 # 终端彩色输出
+  desktop: true                  # macOS 系统通知
+  sound: true                    # 触发时播放声音
+
+# 信号冷却
+cooldown:
+  phase_four_min_bars: 5         # 阶段四触发后最少间隔 K 线数（5×4H=20小时）
+  phase_two_reentry_bars: 5      # 阶段二出场后冷却 K 线数（5×4H=20小时）
+  signal_repeat_minutes: 60      # 同一信号重复提醒间隔（分钟）
