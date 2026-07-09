@@ -171,8 +171,9 @@ class TradingSystem:
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 logger.info(f"[{timestamp}] 第 {check_count} 轮检查...")
                 await self._refresh_data()
-                # 定期校准（interval_days 周期，近期加权评分）
-                if self.df_4h is not None and self.df_daily is not None:
+                # 定期校准（默认关闭：240 天样本外验证显示参数追逐跑输静态参数）
+                if (self.config.get("calibration", {}).get("enabled", False)
+                        and self.df_4h is not None and self.df_daily is not None):
                     new_params = self.optimizer.maybe_optimize(self.df_4h, self.df_daily)
                     if new_params:
                         logger.info(f"参数已更新: {new_params}")

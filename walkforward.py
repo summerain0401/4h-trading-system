@@ -44,6 +44,10 @@ def parse_args():
     p.add_argument("--lookback", type=int, default=None, help="校准回看天数（默认取 config）")
     p.add_argument("--fee-bps", type=float, default=4.5)
     p.add_argument("--account", type=float, default=10000.0)
+    p.add_argument("--mode", choices=["params", "gate", "all"], default="all",
+                   help="params=参数校准臂 gate=体制开关臂 all=两者")
+    p.add_argument("--gate-lookback", type=int, default=30,
+                   help="体制开关的表现回看天数（近N天策略净利<0→下一段停止开仓）")
     return p.parse_args()
 
 
@@ -80,6 +84,29 @@ def klines_to_df(klines):
     return df
 
 
+def build_gate_schedule(config, df_4h, df_daily, boundaries, fee_bps, gate_lookback_days):
+    """体制开关日程：每个边界只用之前的数据评估策略近 N 天表现
+
+    规则（元动量）：静态策略在近 gate_lookback_days 天的净利 < 0
+    → 下一段停止开新仓/加仓（已有持仓正常管理出场）。
+    """
+    schedule = {}
+    for b in boundaries:
+        w4 = df_4h[(df_4h.index >= b - pd.Timedelta(days=gate_lookback_days + 75))
+                   & (df_4h.index < b)]
+        wd = df_daily[(df_daily.index >= b - pd.Timedelta(days=gate_lookback_days + 105))
+                      & (df_daily.index < b)]
+        if len(w4) < 200:
+            schedule[b] = False
+            continue
+        res = run_backtest(config, w4, wd, fee_bps=fee_bps,
+                           start_ts=b - pd.Timedelta(days=gate_lookback_days + 20))
+        recent_net = sum(c["net"] for c in res["campaigns"]
+                         if c["exit_ts"] >= b - pd.Timedelta(days=gate_lookback_days))
+        schedule[b] = recent_net < 0
+    return schedule
+
+
 def main():
     args = parse_args()
     config = load_config()
@@ -107,46 +134,66 @@ def main():
 
     eval_start = df_4h.index[-1] - pd.Timedelta(days=args.days)
 
-    # ── 第一步：构建校准日程（每个边界只用之前的数据选参，无泄漏）──
+    # ── 边界：每 interval 天一个决策点 ──
     boundaries = []
     b = eval_start
     while b <= df_4h.index[-1]:
         boundaries.append(b)
         b = b + pd.Timedelta(days=interval_days)
 
-    optimizer = ParamOptimizer(config)
-    schedule = {}
-    t0 = time.time()
-    for n, b in enumerate(boundaries, 1):
-        past_4h = df_4h[df_4h.index < b]
-        past_d = df_daily[df_daily.index < b]
-        params = optimizer.calibrate(past_4h, past_d, b)
-        schedule[b] = params
-        logger.info(f"[{n}/{len(boundaries)}] 校准 @ {b:%Y-%m-%d}: {params} "
-                    f"(耗时 {time.time()-t0:.0f}s)")
-
-    # ── 第二步：样本外单遍回测（到达边界时热切换参数，保留持仓状态）──
-    pending = sorted(schedule.keys())
-
-    def reconfigure(bar_ts):
-        new_cfg = None
-        while pending and bar_ts >= pending[0]:
-            boundary = pending.pop(0)
-            params = schedule[boundary]
-            if params:
-                new_cfg = ParamOptimizer.apply_params(copy.deepcopy(config), params)
-        return new_cfg
-
-    wf = run_backtest(config, df_4h, df_daily, fee_bps=args.fee_bps,
-                      start_ts=eval_start, reconfigure=reconfigure)
-
-    # ── 第三步：静态参数对照组 ──
+    # ── 静态参数对照组（所有模式都跑）──
     static = run_backtest(config, df_4h, df_daily, fee_bps=args.fee_bps,
                           start_ts=eval_start)
+    arms = [("静态默认参数（对照）", static)]
+    param_schedule, gate_schedule = None, None
+
+    # ── 参数校准臂 ──
+    if args.mode in ("params", "all"):
+        optimizer = ParamOptimizer(config)
+        param_schedule = {}
+        t0 = time.time()
+        for n, b in enumerate(boundaries, 1):
+            params = optimizer.calibrate(df_4h[df_4h.index < b],
+                                         df_daily[df_daily.index < b], b)
+            param_schedule[b] = params
+            logger.info(f"[{n}/{len(boundaries)}] 校准 @ {b:%Y-%m-%d}: {params} "
+                        f"(耗时 {time.time()-t0:.0f}s)")
+        pending_p = sorted(param_schedule.keys())
+
+        def reconfigure_params(bar_ts):
+            new_cfg = None
+            while pending_p and bar_ts >= pending_p[0]:
+                params = param_schedule[pending_p.pop(0)]
+                if params:
+                    new_cfg = ParamOptimizer.apply_params(copy.deepcopy(config), params)
+            return new_cfg
+
+        wf = run_backtest(config, df_4h, df_daily, fee_bps=args.fee_bps,
+                          start_ts=eval_start, reconfigure=reconfigure_params)
+        arms.append(("参数校准（滚动样本外）", wf))
+
+    # ── 体制开关臂：近 N 天策略亏损 → 下一段停止开仓 ──
+    if args.mode in ("gate", "all"):
+        logger.info(f"构建体制开关日程（表现回看 {args.gate_lookback} 天）...")
+        gate_schedule = build_gate_schedule(config, df_4h, df_daily, boundaries,
+                                            args.fee_bps, args.gate_lookback)
+        pending_g = sorted(gate_schedule.keys())
+
+        def reconfigure_gate(bar_ts):
+            new_cfg = None
+            while pending_g and bar_ts >= pending_g[0]:
+                halt = gate_schedule[pending_g.pop(0)]
+                new_cfg = copy.deepcopy(config)
+                new_cfg["trading_halt"] = halt
+            return new_cfg
+
+        gated = run_backtest(config, df_4h, df_daily, fee_bps=args.fee_bps,
+                             start_ts=eval_start, reconfigure=reconfigure_gate)
+        arms.append((f"体制开关（近{args.gate_lookback}天亏损→停手）", gated))
 
     # ── 报告 ──
     print_section(f"样本外对比（{args.days} 天 | 本金 ${account:,.0f}）")
-    for name, res in (("定期校准（滚动样本外）", wf), ("静态默认参数（对照）", static)):
+    for name, res in arms:
         n = len(res["campaigns"])
         if n == 0:
             print(f"  {name}: 无交易")
@@ -158,25 +205,35 @@ def main():
               f"净盈亏 {nc}{res['net']:+,.0f} ({res['net']/account*100:+.1f}%){Color.RESET} | "
               f"最大回撤 -{res['max_dd']:,.0f} (-{res['max_dd']/account*100:.1f}%)")
 
-    # 校准参数的漂移轨迹
-    print_section("校准参数轨迹")
-    for b in sorted(schedule.keys()):
-        print(f"    {b:%Y-%m-%d}: {schedule[b]}")
+    if param_schedule:
+        print_section("校准参数轨迹")
+        for b in sorted(param_schedule.keys()):
+            print(f"    {b:%Y-%m-%d}: {param_schedule[b]}")
+
+    if gate_schedule:
+        print_section("体制开关轨迹（HALT=停止开仓）")
+        line = []
+        for b in sorted(gate_schedule.keys()):
+            line.append(f"{b:%m-%d}:{'HALT' if gate_schedule[b] else 'ok'}")
+        for i in range(0, len(line), 6):
+            print("    " + "  ".join(line[i:i + 6]))
 
     # 按月净值对比
-    print_section("月末累计净值对比（校准 vs 静态）")
+    print_section("月末累计净值对比")
     def monthly(res):
         m = {}
         for ts_, cum in res["curve"]:
             m[ts_.strftime("%Y-%m")] = cum
         return m
-    m_wf, m_st = monthly(wf), monthly(static)
-    for month in sorted(set(m_wf) | set(m_st)):
-        w = m_wf.get(month)
-        s = m_st.get(month)
-        w_str = f"{w:+8,.0f}" if w is not None else "       -"
-        s_str = f"{s:+8,.0f}" if s is not None else "       -"
-        print(f"    {month}: 校准 {w_str} | 静态 {s_str}")
+    monthly_arms = [(name, monthly(res)) for name, res in arms]
+    months = sorted(set().union(*(m.keys() for _, m in monthly_arms)))
+    for month in months:
+        cells = []
+        for name, m in monthly_arms:
+            v = m.get(month)
+            cells.append(f"{v:+8,.0f}" if v is not None else "       -")
+        print(f"    {month}: " + " | ".join(cells))
+    print("    列顺序: " + " | ".join(name for name, _ in monthly_arms))
 
     print_banner("验证完成")
 

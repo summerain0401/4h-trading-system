@@ -60,8 +60,11 @@ notifications:
   desktop: true                  # macOS 系统通知
   sound: true                    # 触发时播放声音
 
-# 定期校准（不追求万能参数，定期用近期数据校准）
+# 定期校准
+# 2026-07-09 滚动样本外验证结论：参数追逐式校准 240 天跑输静态参数 20 个百分点，
+# 默认关闭。校准器保留用于离线实验（walkforward.py）。
 calibration:
+  enabled: false                 # 监控模式下是否自动调参（样本外证据：关闭更优）
   interval_days: 15              # 校准周期（天）
   lookback_days: 90              # 校准回看窗口（天）
   half_life_days: 30             # 近期加权半衰期：30 天前的交易权重减半

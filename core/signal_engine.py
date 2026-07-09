@@ -50,6 +50,8 @@ class SignalEngine:
         )
         # 加仓批次风险缩放（手册：底仓为主，加仓不应与底仓同额风险）
         self.add_risk_scale = config.get("risk", {}).get("add_risk_scale", 1.0)
+        # 体制开关：True 时不开新仓、不加仓（出场路径不受影响）
+        self.trading_halt = config.get("trading_halt", False)
         self._last_phase_four_ts: Optional[pd.Timestamp] = None
         self._last_exit_ts: Optional[pd.Timestamp] = None
         self._current_phase: str = "phase_one"
@@ -172,7 +174,7 @@ class SignalEngine:
         self, df_daily: pd.DataFrame, df_4h: pd.DataFrame, has_position: bool
     ) -> Optional[Signal]:
         """阶段二：金叉 + 站稳均线 → 开底仓"""
-        if has_position:
+        if has_position or self.trading_halt:
             return None
 
         # 冷却：最低 3 根 K（12h），连续两笔 >2% 亏损 → 熔断 8 根 K（32h）
@@ -300,7 +302,7 @@ class SignalEngine:
         self, df_daily: pd.DataFrame, df_4h: pd.DataFrame, has_position: bool
     ) -> Optional[Signal]:
         """阶段三：布林带张口 + 放量 → 追仓"""
-        if not has_position:
+        if not has_position or self.trading_halt:
             return None
 
         daily_dir = self.check_daily_direction(df_daily)
@@ -376,7 +378,7 @@ class SignalEngine:
         - 价格必须正在接近 VWMA（而非早已在附近横盘）
         - 距离 VWMA 需 > 0.3 ATR（真正回调而非小幅波动）
         """
-        if not has_position:
+        if not has_position or self.trading_halt:
             return None
 
         daily_dir = self.check_daily_direction(df_daily)
@@ -474,6 +476,8 @@ class SignalEngine:
         - 计入阶段四 3 次上限（开仓用掉 1 次）
         - 出场冷却与阶段二相同
         """
+        if self.trading_halt:
+            return None
         # 冷却（同阶段二）
         if self._last_exit_ts is not None:
             min_cool = 8 if self._consecutive_big_losses >= 2 else 3
