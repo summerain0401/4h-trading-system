@@ -42,8 +42,16 @@ class SignalEngine:
         self.phase_four_cooldown = config["cooldown"]["phase_four_min_bars"]
         self.phase_two_reentry_cooldown = config["cooldown"].get("phase_two_reentry_bars", 5)
         self.dir_config = config.get("direction", {})  # V9: 多空不对称参数
-        self._last_phase_four_bar: Optional[int] = None
-        self._last_exit_bar: Optional[int] = None
+        # 总名义仓位上限（账户 × 杠杆 × max_total_position_pct）
+        # 账户基数与仓位计算一致使用 10000（Signal.suggested_size 的口径）
+        self.max_total_notional = (
+            10000 * config["leverage"]
+            * config.get("risk", {}).get("max_total_position_pct", 1.0)
+        )
+        # 加仓批次风险缩放（手册：底仓为主，加仓不应与底仓同额风险）
+        self.add_risk_scale = config.get("risk", {}).get("add_risk_scale", 1.0)
+        self._last_phase_four_ts: Optional[pd.Timestamp] = None
+        self._last_exit_ts: Optional[pd.Timestamp] = None
         self._current_phase: str = "phase_one"
         self._active_position: Optional[dict] = None
         self._phase_four_count: int = 0
@@ -54,6 +62,26 @@ class SignalEngine:
         default = {"adx_entry": 25, "stop_loss_atr": 2.0, "approaching_atr": 0.8,
                    "trailing_atr": 0.8, "timeout_bars": 12}
         return self.dir_config.get(direction, default)
+
+    @staticmethod
+    def _bars_between(ts_then: pd.Timestamp, ts_now: pd.Timestamp) -> float:
+        """两个时间戳之间的 4H K 线数
+
+        冷却/超时必须用时间差计算：实盘 DataFrame 是固定长度的滚动窗口，
+        行索引 len(df)-1 不随时间增长，用索引差会导致冷却永不解除。
+        """
+        return (ts_now - ts_then) / pd.Timedelta(hours=4)
+
+    def _cap_size(self, size: float, price: float) -> float:
+        """按总名义仓位上限截断批次大小（risk.max_total_position_pct 的执行点）"""
+        if price <= 0:
+            return size
+        used = 0.0
+        if self._active_position:
+            used = sum(b["price"] * b["size"]
+                       for b in self._active_position.get("batches", []))
+        remaining = max(self.max_total_notional - used, 0.0)
+        return min(size, remaining / price)
 
     # ============================================================
     # 大周期方向判断（前置）
@@ -136,11 +164,6 @@ class SignalEngine:
                 "passed": True,
                 "reason": f"方向确认：{daily_dir['direction'].upper()}，ADX={daily_dir['adx']:.1f}"}
 
-        self._current_phase = "phase_one"
-        return {"phase": "phase_one", "direction": daily_dir["direction"],
-                "passed": True,
-                "reason": f"方向确认：{daily_dir['direction'].upper()}，ADX={daily_dir['adx']:.1f}"}
-
     # ============================================================
     # 阶段二：趋势启动 → 建底仓
     # ============================================================
@@ -153,10 +176,9 @@ class SignalEngine:
             return None
 
         # 冷却：最低 3 根 K（12h），连续两笔 >2% 亏损 → 熔断 8 根 K（32h）
-        if self._last_exit_bar is not None:
-            bar_index = len(df_4h) - 1
+        if self._last_exit_ts is not None:
             min_cool = 8 if self._consecutive_big_losses >= 2 else 3
-            if bar_index - self._last_exit_bar < min_cool:
+            if self._bars_between(self._last_exit_ts, df_4h.index[-1]) < min_cool:
                 return None
 
         # 方向检查
@@ -255,7 +277,9 @@ class SignalEngine:
             adx_scale = 0.7
         else:
             adx_scale = 0.4
-        scaled_size = pos_info["size"] * adx_scale
+        scaled_size = self._cap_size(pos_info["size"] * adx_scale, entry_price)
+        if scaled_size <= 0:
+            return None
 
         self._current_phase = "phase_two"
         return Signal(
@@ -324,13 +348,16 @@ class SignalEngine:
             account_value=10000, entry_price=entry_price,
             stop_loss_price=sl_price, leverage=self.config["leverage"], side=direction,
         )
+        capped_size = self._cap_size(pos_info["size"] * self.add_risk_scale, entry_price)
+        if capped_size <= 0:
+            return None
 
         self._current_phase = "phase_three"
         return Signal(
             timestamp=datetime.now(tz=BEIJING_TZ), phase="phase_three",
             direction=direction, action="add",
             entry_price=entry_price, stop_loss_price=sl_price,
-            suggested_size=pos_info["size"],
+            suggested_size=capped_size,
             reason=(f"布林带张口+放量, 带宽={bandwidth.iloc[-1]:.4f}, "
                     f"ADX={daily_dir['adx']:.1f}, {direction.upper()}方向加速"),
         )
@@ -372,9 +399,9 @@ class SignalEngine:
         current_close = df_4h["close"].iloc[-1]
 
         # 冷却检查
-        bar_index = len(df_4h) - 1
-        if (self._last_phase_four_bar is not None
-                and bar_index - self._last_phase_four_bar < self.phase_four_cooldown):
+        current_ts = df_4h.index[-1]
+        if (self._last_phase_four_ts is not None
+                and self._bars_between(self._last_phase_four_ts, current_ts) < self.phase_four_cooldown):
             return None
 
         # 距离检查：必须在 0.3~1.5 ATR 范围内（太远=没回调到位，太近=早就在均线附近横盘）
@@ -414,8 +441,11 @@ class SignalEngine:
             account_value=10000, entry_price=entry_price,
             stop_loss_price=sl_price, leverage=self.config["leverage"], side=direction,
         )
+        capped_size = self._cap_size(pos_info["size"] * self.add_risk_scale, entry_price)
+        if capped_size <= 0:
+            return None
 
-        self._last_phase_four_bar = bar_index
+        self._last_phase_four_ts = current_ts
         self._current_phase = "phase_four"
 
         dist_pct = distance / current_close * 100
@@ -424,7 +454,7 @@ class SignalEngine:
             timestamp=datetime.now(tz=BEIJING_TZ), phase="phase_four",
             direction=direction, action="add",
             entry_price=entry_price, stop_loss_price=sl_price,
-            suggested_size=pos_info["size"],
+            suggested_size=capped_size,
             reason=(f"价格回调靠近20VWMA(距离={dist_pct:.1f}%), "
                     f"{stable_note}20VWMA={current_vwma20:.1f}"),
         )
@@ -445,10 +475,9 @@ class SignalEngine:
         - 出场冷却与阶段二相同
         """
         # 冷却（同阶段二）
-        if self._last_exit_bar is not None:
-            bar_index = len(df_4h) - 1
+        if self._last_exit_ts is not None:
             min_cool = 8 if self._consecutive_big_losses >= 2 else 3
-            if bar_index - self._last_exit_bar < min_cool:
+            if self._bars_between(self._last_exit_ts, df_4h.index[-1]) < min_cool:
                 return None
 
         daily_dir = self.check_daily_direction(df_daily)
@@ -473,9 +502,9 @@ class SignalEngine:
         current_close = df_4h["close"].iloc[-1]
 
         # 冷却检查（使用阶段四冷却计数）
-        bar_index = len(df_4h) - 1
-        if (self._last_phase_four_bar is not None
-                and bar_index - self._last_phase_four_bar < self.phase_four_cooldown):
+        current_ts = df_4h.index[-1]
+        if (self._last_phase_four_ts is not None
+                and self._bars_between(self._last_phase_four_ts, current_ts) < self.phase_four_cooldown):
             return None
 
         # 距离检查：必须在 0.3~1.5 ATR 范围内
@@ -528,9 +557,11 @@ class SignalEngine:
             adx_scale = 0.7
         else:
             adx_scale = 0.4
-        scaled_size = pos_info["size"] * adx_scale * 0.5  # 半仓
+        scaled_size = self._cap_size(pos_info["size"] * adx_scale * 0.5, entry_price)  # 半仓
+        if scaled_size <= 0:
+            return None
 
-        self._last_phase_four_bar = bar_index
+        self._last_phase_four_ts = current_ts
         self._current_phase = "phase_four"
         self._phase_four_count = 1  # 开仓计入 3 次上限
 
@@ -648,15 +679,15 @@ class SignalEngine:
             )
 
         # V9-超时保护：按方向不对称（LONG=12K, SHORT=8K）
-        entry_bar = position.get("entry_bar")
-        if entry_bar is not None and current_price and entry_price:
-            bars_held = len(df_4h) - 1 - entry_bar
+        entry_ts = position.get("entry_ts")
+        if entry_ts is not None and current_price and entry_price:
+            bars_held = self._bars_between(entry_ts, df_4h.index[-1])
             is_losing = (direction == "long" and current_price < entry_price) or (direction == "short" and current_price > entry_price)
             if bars_held >= dp["timeout_bars"] and is_losing:
                 return Signal(
                     timestamp=datetime.now(tz=BEIJING_TZ), phase=phase,
                     direction=direction, action="exit",
-                    reason=f"持仓超时({bars_held}根K线/48h+)仍亏损，主动离场",
+                    reason=f"持仓超时({bars_held:.0f}根K线/48h+)仍亏损，主动离场",
                 )
 
         # P2-1: 趋势衰减出场——ADX 降 >40% 且 ADX < 25 + 4 根 K 未创新高/低 → 提前离场
@@ -678,6 +709,81 @@ class SignalEngine:
                 )
 
         return None
+
+    # ============================================================
+    # 批次止损（回测保真：模拟交易所按批次挂的止损单在 K 线内触发）
+    # ============================================================
+
+    def check_batch_stops(self, df_4h: pd.DataFrame) -> tuple[list[dict], bool]:
+        """逐批次检查盘中止损：触发的批次单独平仓，其余批次继续持有
+
+        每个批次（底仓/各次加仓）带自己的止损价，对应实盘中
+        每次成交后挂出的独立 reduce-only 止损单。加仓批次的紧止损
+        触发时只砍掉该批次，底仓继续跟踪趋势——避免"方向对了、
+        加仓拖累整笔亏损"的出场语义缺陷。
+
+        成交价按止损价计，跳空时用 K 线开盘价（更差方向）修正。
+        全部批次止损 → 执行与正常出场一致的状态簿记（熔断计数、冷却）。
+
+        Returns:
+            (events, position_closed)
+            events: [{price, size, stop, phase, is_base, fill_px}, ...]
+        """
+        pos = self._active_position
+        if not pos or len(df_4h) == 0:
+            return [], False
+        batches = pos.get("batches")
+        if not batches:
+            if not pos.get("stop_loss_price"):
+                return [], False
+            # 兼容：无批次信息时退化为单一止损
+            batches = [{"price": pos.get("entry_price"), "size": 0.0,
+                        "stop": pos["stop_loss_price"],
+                        "phase": pos.get("current_phase", "phase_two"), "is_base": True}]
+            pos["batches"] = batches
+
+        side = pos.get("side", "long")
+        bar_high = df_4h["high"].iloc[-1]
+        bar_low = df_4h["low"].iloc[-1]
+        bar_open = df_4h["open"].iloc[-1]
+
+        events, remaining = [], []
+        for b in batches:
+            stop = b.get("stop")
+            hit = stop is not None and (
+                (side == "long" and bar_low <= stop)
+                or (side == "short" and bar_high >= stop)
+            )
+            if hit:
+                fill = min(stop, bar_open) if side == "long" else max(stop, bar_open)
+                events.append({**b, "fill_px": fill})
+            else:
+                remaining.append(b)
+
+        if not events:
+            return [], False
+
+        pos["batches"] = remaining
+        closed = len(remaining) == 0
+        if closed:
+            # 熔断计数按底仓入场价 vs 底仓成交价（与正常出场路径口径一致）
+            entry = pos.get("entry_price")
+            base_ev = next((e for e in events if e.get("is_base")), events[-1])
+            if entry:
+                fill = base_ev["fill_px"]
+                loss_pct = (entry - fill) / entry if side == "long" else (fill - entry) / entry
+                if loss_pct > 0.02:
+                    self._consecutive_big_losses += 1
+                else:
+                    self._consecutive_big_losses = 0
+            self._active_position = None
+            self._phase_four_count = 0
+            self._last_exit_ts = df_4h.index[-1]
+        else:
+            # 剩余批次中最早的一批作为整体持仓的硬止损口径
+            pos["stop_loss_price"] = remaining[0].get("stop")
+
+        return events, closed
 
     # ============================================================
     # 4H 级别震荡检测
@@ -750,7 +856,7 @@ class SignalEngine:
                         self._consecutive_big_losses = 0  # 盈利或小亏 → 重置
                 self._active_position = None
                 self._phase_four_count = 0
-                self._last_exit_bar = len(df_4h) - 1
+                self._last_exit_ts = df_4h.index[-1]
                 return signals
 
         # 震荡市 → 不交易
@@ -761,8 +867,8 @@ class SignalEngine:
         if self._is_4h_ranging(df_4h):
             return signals
 
-        # 方向变化 → 重置计数器
-        if pos and pos.get("direction") != daily_dir["direction"]:
+        # 方向变化 → 重置计数器（持仓字典的方向键是 side）
+        if pos and pos.get("side") != daily_dir["direction"]:
             self._phase_four_count = 0
 
         # 阶段一
@@ -782,7 +888,10 @@ class SignalEngine:
                     "stop_loss_price": p2.stop_loss_price,
                     "entry_price": p2.entry_price,
                     "entry_adx": entry_adx_4h,
-                    "entry_bar": len(df_4h) - 1,
+                    "entry_ts": df_4h.index[-1],
+                    "batches": [{"price": p2.entry_price, "size": p2.suggested_size,
+                                 "stop": p2.stop_loss_price, "phase": "phase_two",
+                                 "is_base": True}],
                 }
                 self._phase_four_count = 0
                 return signals
@@ -798,7 +907,10 @@ class SignalEngine:
                     "stop_loss_price": p4_entry.stop_loss_price,
                     "entry_price": p4_entry.entry_price,
                     "entry_adx": entry_adx_4h,
-                    "entry_bar": len(df_4h) - 1,
+                    "entry_ts": df_4h.index[-1],
+                    "batches": [{"price": p4_entry.entry_price, "size": p4_entry.suggested_size,
+                                 "stop": p4_entry.stop_loss_price, "phase": "phase_four",
+                                 "is_base": True}],
                 }
                 return signals
 
@@ -808,9 +920,19 @@ class SignalEngine:
             p3 = self.check_phase_three(df_daily, df_4h, has_position)
             if p3:
                 signals.append(p3)
-                # SHORT: 紧止损（下跌反弹暴烈需保护）；LONG: 保持原宽止损（慢涨回踩健康）
-                if p3.stop_loss_price and pos and p3.direction == "short":
-                    pos["stop_loss_price"] = p3.stop_loss_price
+                target = self._active_position or pos
+                if target is not None:
+                    target.setdefault("batches", []).append({
+                        "price": p3.entry_price, "size": p3.suggested_size,
+                        "stop": p3.stop_loss_price, "phase": "phase_three",
+                        "is_base": False,
+                    })
+                # SHORT: 收紧整体止损（下跌反弹暴烈需保护）——全部批次止损收到阶段三止损价
+                if p3.stop_loss_price and target is not None and p3.direction == "short":
+                    for b in target.get("batches", []):
+                        if b.get("stop") is None or p3.stop_loss_price < b["stop"]:
+                            b["stop"] = p3.stop_loss_price
+                    target["stop_loss_price"] = p3.stop_loss_price
 
         # 阶段四（有仓位，限制每趋势最多 3 次）
         max_phase_four = 3
@@ -818,6 +940,13 @@ class SignalEngine:
             p4 = self.check_phase_four(df_daily, df_4h, has_position)
             if p4:
                 signals.append(p4)
+                target = self._active_position or pos
+                if target is not None:
+                    target.setdefault("batches", []).append({
+                        "price": p4.entry_price, "size": p4.suggested_size,
+                        "stop": p4.stop_loss_price, "phase": "phase_four",
+                        "is_base": False,
+                    })
                 self._phase_four_count += 1
 
         return signals

@@ -12,7 +12,8 @@ leverage: 5
 # 风险管理
 risk:
   max_risk_per_trade: 0.015      # 单笔最大亏损占比（总资金的 1.5%）
-  max_total_position_pct: 1.0    # 最大总仓位占比（100%）
+  max_total_position_pct: 1.0    # 最大总仓位占比（100%，按 账户×杠杆 的名义仓位执行）
+  add_risk_scale: 1.0            # 加仓批次风险 = 底仓风险 × 此系数（手册：底仓为主、加仓递减）
 
 # 各阶段止损 ATR 倍数
 stop_loss:
@@ -58,6 +59,14 @@ notifications:
   terminal: true                 # 终端彩色输出
   desktop: true                  # macOS 系统通知
   sound: true                    # 触发时播放声音
+
+# 定期校准（不追求万能参数，定期用近期数据校准）
+calibration:
+  interval_days: 15              # 校准周期（天）
+  lookback_days: 90              # 校准回看窗口（天）
+  half_life_days: 30             # 近期加权半衰期：30 天前的交易权重减半
+  dd_penalty: 1.0                # 评分中最大回撤的惩罚系数
+  fee_bps: 4.5                   # 校准回测用的单边手续费（基点）
 
 # 信号冷却
 cooldown:

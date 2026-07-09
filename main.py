@@ -25,6 +25,7 @@ from exchange.hl_client import HLClient
 from core.data_fetcher import DataFetcher
 from core.risk_manager import RiskManager
 from core.signal_engine import SignalEngine
+from core.backtester import swap_engine
 from core.param_optimizer import ParamOptimizer
 from core.order_executor import OrderExecutor
 from notify.terminal import (
@@ -170,13 +171,14 @@ class TradingSystem:
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 logger.info(f"[{timestamp}] 第 {check_count} 轮检查...")
                 await self._refresh_data()
-                # 每 30 天自动参数优化
+                # 定期校准（interval_days 周期，近期加权评分）
                 if self.df_4h is not None and self.df_daily is not None:
                     new_params = self.optimizer.maybe_optimize(self.df_4h, self.df_daily)
                     if new_params:
                         logger.info(f"参数已更新: {new_params}")
                         opt_cfg = self.optimizer.apply_to_config(self.config)
-                        self.engine = SignalEngine(opt_cfg, RiskManager(opt_cfg))
+                        # 热切换：保留持仓与冷却状态
+                        self.engine = swap_engine(self.engine, opt_cfg)
                 price = await self.fetcher.get_current_price()
                 if price:
                     self.current_price = price
@@ -213,8 +215,14 @@ class TradingSystem:
                                 notify_signal(sig.phase, sig.direction, sig.action, sig.entry_price or 0)
                             elif sig.action == "add":
                                 result = self.executor.execute_add(sig)
-                                if sig.stop_loss_price and self.position_info:
-                                    self.position_info["stop_loss_price"] = sig.stop_loss_price
+                                # 阶段三 SHORT 收紧整体止损：撤全部止损单按批次重挂
+                                # （其余加仓的批次止损已在 execute_add 内单独挂出）
+                                if sig.phase == "phase_three" and sig.direction == "short":
+                                    batches = (self.engine._active_position or {}).get("batches") or []
+                                    if batches:
+                                        self.executor.replace_all_stops(sig.direction, batches)
+                                    if sig.stop_loss_price and self.position_info:
+                                        self.position_info["stop_loss_price"] = sig.stop_loss_price
                                 logger.info(f"加仓: {sig.phase}")
                         else:
                             if sig.action == "exit":

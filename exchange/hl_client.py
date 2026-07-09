@@ -75,6 +75,10 @@ class HLClient:
     def get_user_state(self, address: str) -> Optional[dict]:
         return self._post_info({"type": "clearinghouseState", "user": address})
 
+    def get_open_orders(self, address: str) -> list:
+        result = self._post_info({"type": "openOrders", "user": address})
+        return result if isinstance(result, list) else []
+
     def get_meta(self) -> Optional[dict]:
         return self._post_info({"type": "meta"})
 
@@ -107,12 +111,24 @@ class HLClient:
             logger.error(f"撤单失败: {e}")
             return None
 
-    def cancel_all_orders(self) -> Optional[dict]:
-        """取消所有挂单"""
-        if not self.exchange:
+    def cancel_all_orders(self, coin: Optional[str] = None) -> Optional[dict]:
+        """取消所有挂单（可选按币种过滤）
+
+        SDK 的 bulk_cancel 需要显式的 (coin, oid) 列表，
+        因此先查询当前挂单再逐一构造撤单请求。
+        """
+        if not self.exchange or not self.account_address:
             return None
         try:
-            return self.exchange.bulk_cancel()
+            open_orders = self.get_open_orders(self.account_address)
+            requests_ = [
+                {"coin": o["coin"], "oid": o["oid"]}
+                for o in open_orders
+                if coin is None or o.get("coin") == coin
+            ]
+            if not requests_:
+                return None
+            return self.exchange.bulk_cancel(requests_)
         except Exception as e:
             logger.error(f"取消挂单失败: {e}")
             return None

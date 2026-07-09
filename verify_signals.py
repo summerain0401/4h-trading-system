@@ -23,10 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from exchange.hl_client import HLClient
 from core.risk_manager import RiskManager
 from core.signal_engine import SignalEngine
-from core.indicators import (
-    calc_ema, calc_vwma, calc_adx, calc_atr, calc_bollinger_bands,
-    calc_ema_slope, count_ma_crosses, is_bb_squeeze_expanding, is_volume_surge,
-)
+from core.backtester import run_backtest
 from storage.db import init_db, insert_klines
 from storage.models import Kline
 from notify.terminal import (
@@ -47,6 +44,10 @@ def parse_args():
     g.add_argument("--days", type=int, default=90, help="回测最近 N 天（默认 90）")
     g.add_argument("--start", type=str, help="起始日期 YYYY-MM-DD（需配合 --end）")
     p.add_argument("--end", type=str, help="结束日期 YYYY-MM-DD（默认今天）")
+    p.add_argument("--fee-bps", type=float, default=4.5,
+                   help="单边 taker 手续费（基点，默认 4.5 = 0.045%%）")
+    p.add_argument("--account", type=float, default=10000.0,
+                   help="模拟账户本金 USD（默认 10000，与信号引擎仓位计算一致）")
     return p.parse_args()
 
 
@@ -150,44 +151,16 @@ async def main():
     # ====== 历史信号回溯 ======
     print_banner(f"🔍 历史信号回溯 ({total_days} 天)")
 
+    account = args.account
     detected = []
-    has_pos = False
-
-    engine._active_position = None
-    engine._phase_four_count = 0
-    engine._last_phase_four_bar = None
-    engine._last_exit_bar = None
-    engine._consecutive_big_losses = 0
-
-    for i in range(60, len(df_4h)):
-        w4 = df_4h.iloc[:i]
-        wd = df_daily[df_daily.index <= w4.index[-1]]
-        if len(wd) < 30:
-            continue
-
-        signals = engine.run_all_checks(wd, w4, has_position=has_pos)
-        for sig in signals:
-            if sig.action == "exit":
-                has_pos = False
-            else:
-                has_pos = True
-
-            detected.append({
-                "time": w4.index[-1],
-                "price": w4["close"].iloc[-1],
-                "phase": sig.phase,
-                "direction": sig.direction,
-                "action": sig.action,
-                "reason": sig.reason,
-                "entry_price": sig.entry_price,
-                "stop_loss": sig.stop_loss_price,
-            })
+    result = run_backtest(config, df_4h, df_daily, fee_bps=args.fee_bps, collect=detected)
+    campaigns = result["campaigns"]
 
     if detected:
         print(f"\n  共 {len(detected)} 个信号:\n")
         pmap = {"phase_two": "阶段二·启动", "phase_three": "阶段三·加速",
                 "phase_four": "阶段四·回调"}
-        amap = {"entry": "开仓", "add": "加仓", "exit": "平仓"}
+        amap = {"entry": "开仓", "add": "加仓", "exit": "平仓", "reduce": "批止损"}
 
         for s in detected:
             dc = Color.GREEN if s["direction"] == "long" else Color.RED
@@ -219,38 +192,54 @@ async def main():
         print(f"  做多: {len(longs)} | 做空: {len(shorts)}")
         print(f"  开仓: {len(entries)} | 加仓: {len(adds)} | 平仓: {len(exits)}")
 
-        # 交易配对
-        if entries:
-            print_section("交易盈亏估算（入场→出场配对）")
-            leverage = config["leverage"]
-            trades = []
-            ep = ed = et = None
-            for s in detected:
-                if s["action"] == "entry":
-                    ep = s["price"]; et = s["time"]; ed = s["direction"]
-                elif s["action"] == "exit" and ep:
-                    spot_pnl = (s["price"] - ep) / ep * 100 if ed == "long" else (ep - s["price"]) / ep * 100
-                    trades.append({"entry_ts": et, "direction": ed, "entry_px": ep,
-                                   "exit_px": s["price"], "spot_pnl": spot_pnl,
-                                   "pnl_pct": spot_pnl * leverage})
-                    ep = None
+        # 完整交易结算（底仓+加仓+双边手续费，账户口径）
+        if campaigns:
+            print_section(f"交易盈亏（含加仓+手续费 | 本金 ${account:,.0f} | taker {args.fee_bps}bp/边）")
+            wins = [c for c in campaigns if c["net"] > 0]
+            total_net = sum(c["net"] for c in campaigns)
+            total_gross = sum(c["gross"] for c in campaigns)
+            total_base = sum(c["base_gross"] for c in campaigns)
+            total_adds = sum(c["adds_gross"] for c in campaigns)
+            total_fees = sum(c["fees"] for c in campaigns)
+            total_adds_n = sum(c["n_adds"] for c in campaigns)
+            win_rate = len(wins) / len(campaigns) * 100
 
-            if trades:
-                wins = [t for t in trades if t["pnl_pct"] > 0]
-                total = sum(t["pnl_pct"] for t in trades)
-                total_spot = sum(t["spot_pnl"] for t in trades)
-                win_rate = len(wins) / len(trades) * 100 if trades else 0
-                print(f"  配对交易: {len(trades)} 笔 | 杠杆: {leverage}x")
-                print(f"  胜率: {win_rate:.0f}% ({len(wins)}W/{len(trades)-len(wins)}L)")
-                tc = Color.GREEN if total > 0 else Color.RED
-                print(f"  累计现货盈亏: {tc}{total_spot:+.1f}%{Color.RESET}")
-                print(f"  累计杠杆盈亏: {tc}{total:+.1f}%{Color.RESET}")
-                for t in trades:
-                    c = Color.GREEN if t["pnl_pct"] > 0 else Color.RED
-                    ts = t["entry_ts"].strftime("%m-%d")
-                    print(f"    {ts} {t['direction']} {t['entry_px']:.0f}→{t['exit_px']:.0f}: "
-                          f"现货 {c}{t['spot_pnl']:+.1f}%{Color.RESET} | "
-                          f"{leverage}x杠杆 {c}{t['pnl_pct']:+.1f}%{Color.RESET}")
+            print(f"  完整交易: {len(campaigns)} 笔 | 净胜率: {win_rate:.0f}% ({len(wins)}W/{len(campaigns)-len(wins)}L)")
+            tc = Color.GREEN if total_net > 0 else Color.RED
+            print(f"  净盈亏: {tc}{total_net:+,.0f} USD ({total_net/account*100:+.1f}% 账户){Color.RESET}"
+                  f"  = 毛利 {total_gross:+,.0f} - 手续费 {total_fees:,.0f}")
+            bc = Color.GREEN if total_base > 0 else Color.RED
+            ac = Color.GREEN if total_adds > 0 else Color.RED
+            print(f"  归因: 底仓 {bc}{total_base:+,.0f}{Color.RESET} ({len(campaigns)} 笔)"
+                  f" | 加仓 {ac}{total_adds:+,.0f}{Color.RESET} ({total_adds_n} 次)")
+            print()
+            for c in campaigns:
+                cc = Color.GREEN if c["net"] > 0 else Color.RED
+                ts = c["entry_ts"].strftime("%m-%d")
+                open_mark = " [未平仓]" if c.get("is_open") else ""
+                base_px = c["batches"][0]["price"]
+                stop_note = f" 批止损×{c['n_stopped']}" if c.get("n_stopped") else ""
+                print(f"    {ts} {c['direction']} {base_px:.0f}→{c['exit_px']:.0f}"
+                      f" 加仓×{c['n_adds']}{stop_note}: 底仓 {c['base_gross']:+,.0f} | 加仓 {c['adds_gross']:+,.0f}"
+                      f" | 费 {c['fees']:,.0f} | 净 {cc}{c['net']:+,.0f}"
+                      f" ({c['net']/account*100:+.1f}%){Color.RESET}{open_mark}")
+
+            # 净值曲线（逐笔累计）与最大回撤
+            print_section("净值曲线（逐笔累计）")
+            dd_c = Color.RED if result["max_dd"] > 0 else Color.DIM
+            print(f"  最大回撤: {dd_c}-{result['max_dd']:,.0f} USD"
+                  f" (-{result['max_dd']/account*100:.1f}% 账户){Color.RESET}"
+                  + (f" | 谷底: {result['trough_ts'].strftime('%m-%d %H:%M')}"
+                     if result.get("trough_ts") is not None else ""))
+            # 按月汇总累计净值
+            monthly = {}
+            for ts_, cum in result["curve"]:
+                monthly[ts_.strftime("%Y-%m")] = cum
+            for month, cum in monthly.items():
+                mc = Color.GREEN if cum >= 0 else Color.RED
+                bar_len = min(int(abs(cum) / account * 100), 40)
+                bar = ("█" * bar_len) if bar_len else "·"
+                print(f"    {month} 月末累计: {mc}{cum:+8,.0f} ({cum/account*100:+5.1f}%) {bar}{Color.RESET}")
     else:
         print(f"\n  {Color.DIM}此时间段内未检测到信号{Color.RESET}")
 
