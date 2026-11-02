@@ -1,127 +1,57 @@
-# BTC 4H 波段交易系统 V9
+# BTC 4H 波段交易系统
 
-基于 Hyperliquid 的半自动 BTC 趋势跟踪交易系统，使用 4 小时 K 线进行波段操作。四阶段信号引擎覆盖完整的趋势生命周期：方向确认 → 金叉入场 → 加速追仓 → 回调加仓。
+[中文](README.md) | [English](README.en.md)
 
-## 核心策略
+基于 Hyperliquid 的 BTC 趋势跟踪研究与半自动交易工具，使用 4 小时 K 线及日线辅助判断，提供终端信号、历史回测和 Web 仪表盘。
 
-| 阶段 | 名称 | 操作 | 说明 |
-|------|------|------|------|
-| **Phase 1** | 方向确认 | 判定趋势方向 | EMA 排列 + ADX 过滤 + K 线形态确认，决定 LONG/SHORT |
-| **Phase 2** | 金叉入场 | 首次建仓 | 5EMA 上穿 20VWMA (LONG) 或下穿 (SHORT)，最近 3 根 K 线入场 |
-| **Phase 3** | 趋势加速 | SHORT 追仓 | 趋势加速形成的追仓机会，仅做空 |
-| **Phase 4** | 回调加仓 | 已有仓位=加仓 / 无仓位=独立入场 | 价格回调至 20VWMA 附近，半仓独立入场 |
+**运行边界：** 未提供私钥时只读取行情与生成信号；同时配置 API 钱包私钥和主钱包地址后，监控循环可以自动提交真实订单。网络由 `config.yaml` 决定，不应把监控模式理解为模拟交易。
 
-### 风险控制
+## 策略与实现
 
-- **非对称多空参数**：LONG/SHORT 使用不同的止损宽度、跟踪缓冲、超时设置
-- **三层利润保护**：盈利 <5% 正常跟踪 → 5-10% 收紧至 9EMA+0.5ATR → >10% 锁仓至 9EMA
-- **仓位计算**：`仓位 = 最大亏损 / |入场价 - 止损价|`，基于风险优先
-- **冷却机制**：出场后最少 3 根 K 线冷却；连续两次 >2% 亏损触发 8 根 K 线熔断
-- **震荡市过滤**：ADX < 20 + BB/DI 收敛 + Choppiness Index > 65，三重条件独立判断
+方向确认 → 金叉入场 → SHORT 趋势加速 → VWMA 回调加仓 / 独立入场。包含多空非对称参数、分批止损、跟踪退出、冷却及震荡过滤。规则和历史实验见 [4H 波段交易手册](4H波段交易手册.md)；历史收益不是今天的复核结果，也不代表未来收益。
 
-## 快速开始
+`core/backtester.py` 为共享回测核心；`verify_signals.py` 做区间回测，`walkforward.py` 做滚动样本外比较，`exit_experiment.py` 做退出参数实验。自适应参数优化默认关闭，策略修改需同步手册。
 
-### 环境要求
+## 安装与只读起步
 
-- Python 3.9+
-- macOS / Linux
-
-### 安装
+源码使用 Python 3.10+ 语法；建议在 macOS / Linux 的独立虚拟环境中运行：
 
 ```bash
-# 克隆仓库
-git clone git@github.com:summerain0401/4h-trading-system.git
-cd 4h-trading-system
-
-# 创建虚拟环境并安装依赖
-python -m venv venv
-source venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 配置
-
-创建 `.env` 文件，设置 Hyperliquid API 密钥：
-
-```env
-PRIVATE_KEY=your_wallet_private_key
-HYPERLIQUID_WALLET_ADDRESS=your_wallet_address
-```
-
-> 不设置密钥时，系统以只读模式运行（仅生成信号，不下单）。
-
-交易参数在 `config.yaml` 中配置，包括杠杆、止损 ATR 倍数、多空方向参数等。
-
-### 使用
-
-```bash
-# 交互式 CLI 菜单
-python main.py
-
-# 直接进入监控模式（每 5 分钟检查一次）
-python main.py monitor
-
-# 快速查看市场状态
 python main.py status
-
-# Web 仪表盘（FastAPI，端口 8080）
-python dashboard.py
-
-# 回测（灵活日期范围）
-python verify_signals.py                        # 默认：近 90 天主网数据
-python verify_signals.py --days 180             # 近 180 天
-python verify_signals.py --start 2025-01-01 --end 2025-06-30  # 指定日期
 ```
 
-## 项目结构
-
-```
-main.py                  # CLI 入口，TradingSystem 编排器
-dashboard.py             # FastAPI + 服务端渲染仪表盘 (端口 8080)
-verify_signals.py        # 回测脚本，支持灵活日期范围
-config.yaml              # 交易参数配置
-
-core/
-  signal_engine.py       # 核心 — 四阶段信号检测 + 止损/止盈
-  indicators.py          # 纯函数指标 (EMA, VWMA, ADX, ATR, BB, DI, CI)
-  patterns.py            # K 线形态识别
-  risk_manager.py        # 仓位计算、止损价计算
-  order_executor.py      # 信号 → 交易所订单转换
-  data_fetcher.py        # Hyperliquid OHLCV 数据拉取
-  param_optimizer.py     # 网格搜索参数优化
-
-exchange/
-  hl_client.py           # Hyperliquid 对接 (REST + Python SDK)
-
-storage/
-  models.py              # 数据类 (Kline, Signal, Position, MarketState)
-  db.py                  # SQLite CRUD
-
-notify/
-  terminal.py            # 终端彩色信号卡片输出
-  desktop.py             # macOS 通知中心提醒
-
-templates/
-  dashboard.html         # 仪表盘前端页面
-```
-
-## 技术要点
-
-- **时区**：所有时间戳使用 **UTC+8（北京时间）**，定义在 `storage/models.py` 的 `BEIJING_TZ`
-- **信号引擎**：纯函数设计，接收 DataFrame 返回 Signal 对象，无副作用
-- **数据源**：Hyperliquid 主网，4H 为主周期，1D 为大周期辅助
-- **参数优化同步**：代码修改后需同步更新 `4H波段交易手册.md`
-
-## 测试
+以上命令读取网络行情并初始化本地 SQLite。首次运行前，确认当前终端没有继承 `PRIVATE_KEY` 或 `HYPERLIQUID_PRIVATE_KEY`。
 
 ```bash
-pytest tests/ -v
+python main.py             # 交互式菜单
+python main.py monitor     # 持续监控；配置密钥后可自动下单
+python verify_signals.py --days 90
+python walkforward.py --days 240 --interval 15 --mode all
 ```
 
-## 免责声明
+当前 CLI 从**进程环境变量**读取配置，不会自动加载 `.env` 文件。私钥名称为 `PRIVATE_KEY` 或 `HYPERLIQUID_PRIVATE_KEY`；主钱包地址为 `HYPERLIQUID_WALLET_ADDRESS` 或 `HYPERLIQUID_MAIN_ADDRESS`。请自行安全注入，勿提交或粘贴真实密钥到文档中。
 
-本系统仅供研究和教育目的使用。加密货币交易具有高风险，过往表现不代表未来收益。使用本软件进行的任何交易决策均由用户自行承担责任。
+## 可选 Web 仪表盘
 
-## License
+```bash
+pip install fastapi uvicorn
+python dashboard.py
+```
 
-MIT
+默认端口 8080，绑定 `0.0.0.0`。FastAPI / Uvicorn 尚未列入 `requirements.txt`；仪表盘读取的私钥变量为 `HYPERLIQUID_PRIVATE_KEY`，钱包地址为 `HYPERLIQUID_WALLET_ADDRESS`。
+
+## 目录与已知限制
+
+- `core/`：信号、指标、仓位风险、回测及订单执行。
+- `exchange/`：行情 REST 与 Hyperliquid SDK。
+- `storage/`：数据模型及 SQLite；时间口径为 UTC+8。
+- `notify/`、`templates/`：通知与仪表盘视图。
+
+`tests/` 当前没有测试用例，不能把 `pytest tests/ -v` 视作已有测试覆盖。交互菜单的持仓/手动下单项仍含未完成逻辑，不属于已经验证的功能。本次整理未执行联网回测或真实交易。
+
+## 风险与许可
+
+仅供研究；加密资产交易可能造成损失。原 README 标注 MIT，但默认分支尚无独立 LICENSE 文件，本次未补设或更换项目许可证。
