@@ -1,6 +1,6 @@
 # BTC 4H Swing Trading System
 
-[中文](README.md) | [English](README.en.md)
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 A Hyperliquid BTC trend-following research and semi-automated trading tool using 4-hour candles with daily context. Includes terminal signals, historical backtesting, and a web dashboard.
 
